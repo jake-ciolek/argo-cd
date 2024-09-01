@@ -241,16 +241,24 @@ func (c *liveStateCache) loadCacheSettings() (*cacheSettings, error) {
 	return &cacheSettings{clusterSettings, appInstanceLabelKey, argo.GetTrackingMethod(c.settingsMgr), resourceUpdatesOverrides, ignoreResourceUpdatesEnabled}, nil
 }
 
-func asResourceNode(r *clustercache.Resource) appv1.ResourceNode {
+func asResourceNode(r *clustercache.Resource, parent *clustercache.Resource) appv1.ResourceNode {
 	gv, err := schema.ParseGroupVersion(r.Ref.APIVersion)
 	if err != nil {
 		gv = schema.GroupVersion{}
 	}
+
 	parentRefs := make([]appv1.ResourceRef, len(r.OwnerRefs))
-	for i, ownerRef := range r.OwnerRefs {
-		ownerGvk := schema.FromAPIVersionAndKind(ownerRef.APIVersion, ownerRef.Kind)
-		ownerKey := kube.NewResourceKey(ownerGvk.Group, ownerRef.Kind, r.Ref.Namespace, ownerRef.Name)
-		parentRefs[i] = appv1.ResourceRef{Name: ownerRef.Name, Kind: ownerKey.Kind, Namespace: r.Ref.Namespace, Group: ownerKey.Group, UID: string(ownerRef.UID)}
+
+	if parent != nil {
+		ownerKey := kube.NewResourceKey(parent.Resource.GetAPIVersion(), parent.Resource.GetKind(), "", parent.Resource.GetName())
+		parentRefs = append(parentRefs, appv1.ResourceRef{Name: ownerKey.Name, Kind: ownerKey.Kind, Namespace: "", Group: ownerKey.Group, UID: string(parent.Resource.GetUID())})
+	} else {
+		for i, ownerRef := range r.OwnerRefs {
+			ownerGvk := schema.FromAPIVersionAndKind(ownerRef.APIVersion, ownerRef.Kind)
+			ownerKey := kube.NewResourceKey(ownerGvk.Group, ownerRef.Kind, r.Ref.Namespace, ownerRef.Name)
+
+			parentRefs[i] = appv1.ResourceRef{Name: ownerRef.Name, Kind: ownerKey.Kind, Namespace: r.Ref.Namespace, Group: ownerKey.Group, UID: string(ownerRef.UID)}
+		}
 	}
 	var resHealth *appv1.HealthStatus
 	resourceInfo := resInfo(r)
@@ -601,7 +609,49 @@ func (c *liveStateCache) IterateHierarchy(server string, key kube.ResourceKey, a
 		return err
 	}
 	clusterInfo.IterateHierarchy(key, func(resource *clustercache.Resource, namespaceResources map[kube.ResourceKey]*clustercache.Resource) bool {
-		return action(asResourceNode(resource), getApp(resource, namespaceResources))
+		var parent *clustercache.Resource
+		// Extract ownerKind, ownerName, ownerApiVersion from the current resource's annotations
+		var ownerKind, ownerName, ownerApiVersion, ownerNamespace string
+		if resource.Resource != nil && resource.Resource.Object != nil {
+			if metadata, ok := resource.Resource.Object["metadata"].(map[string]interface{}); ok {
+				if annotations, ok := metadata["annotations"].(map[string]interface{}); ok {
+					if val, ok := annotations["argocd.argoproj.io/ownerName"].(string); ok {
+						ownerName = val
+					}
+					if val, ok := annotations["argocd.argoproj.io/ownerKind"].(string); ok {
+						ownerKind = val
+					}
+					if val, ok := annotations["argocd.argoproj.io/ownerApiVersion"].(string); ok {
+						ownerApiVersion = val
+					}
+					if val, ok := annotations["argocd.argoproj.io/ownerNamespace"].(string); ok {
+						ownerNamespace = val
+					}
+				}
+			}
+		}
+
+		if ownerKind != "" && ownerName != "" && ownerApiVersion != "" {
+			foundResources := clusterInfo.FindResources(ownerNamespace, func(r *clustercache.Resource) bool {
+				if r.Resource == nil {
+					return false
+				}
+
+				return r.Ref.Kind == ownerKind &&
+					r.Ref.APIVersion == ownerApiVersion &&
+					r.Ref.Name == ownerName &&
+					(r.Ref.Namespace == ownerNamespace || ownerNamespace == "")
+			})
+
+			// If we found any matching resources, take the first one and get its UID
+			for _, foundResource := range foundResources {
+				if foundResource.Resource != nil && foundResource.Ref.UID != "" {
+					parent = foundResource
+					break
+				}
+			}
+		}
+		return action(asResourceNode(resource, parent), getApp(resource, namespaceResources))
 	})
 	return nil
 }
@@ -628,7 +678,7 @@ func (c *liveStateCache) GetNamespaceTopLevelResources(server string, namespace 
 	resources := clusterInfo.FindResources(namespace, clustercache.TopLevelResource)
 	res := make(map[kube.ResourceKey]appv1.ResourceNode)
 	for k, r := range resources {
-		res[k] = asResourceNode(r)
+		res[k] = asResourceNode(r, nil)
 	}
 	return res, nil
 }
